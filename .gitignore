@@ -1,0 +1,65 @@
+# Output
+captures/
+Recordings/
+recordings/
+*.flac
+*.mp3
+*.opus
+*.wav
+*.part
+*.tmp.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+logs/
+debug/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+.*.sw?
+*~
+\#*\#
+.\#*
+
+# Linux / KDE
+.directory
+.Trash-*
+.fuse_hidden*
+.nfs*
+
+# Secrets
+.env
+.env.*
+config.local.*
+*.local.yml
+*.local.yaml
+*.local.json
+secrets/
+
+# Misc
+*.bak
+*.old
+*.orig
+.DS_Store
+Thumbs.db
