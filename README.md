@@ -45,7 +45,7 @@ Fedora:
 
 ## Install
 
-    git clone https://github.com/YOUR_USER/audiotap.git
+    git clone https://github.com/capitan0n/audiotap.git
     cd audiotap
     chmod +x audiotap.py
 
