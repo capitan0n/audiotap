@@ -158,7 +158,7 @@ it is your responsibility.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+GPLv3. See [LICENSE](LICENSE).
 
 ## Contributing
 
