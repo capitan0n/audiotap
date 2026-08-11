@@ -4,9 +4,9 @@ Capture your Linux system's audio output and automatically split the
 recording into one file per track using MPRIS metadata from the player.
 
 Works with any media player that exposes MPRIS over D-Bus — mpv, VLC,
-Rhythmbox, Clementine, most web browsers, and many others. Uses
-PipeWire's PulseAudio compatibility layer, so it runs on modern PipeWire
-systems as well as classic PulseAudio.
+Rhythmbox, Clementine, Spotify, most web browsers, and many others.
+Uses PipeWire's PulseAudio compatibility layer, so it runs on modern
+PipeWire systems as well as classic PulseAudio.
 
 ## What it does
 
@@ -113,6 +113,29 @@ tab → dropdown → *Audiotap-Silent-Capture*).
    updates its metadata as soon as it loads the next track, while the
    old track's audio is still buffered), cuts are delayed by
    `--switch-delay` seconds.
+
+## Player compatibility
+
+audiotap does not integrate with any specific service — it captures
+whatever is being sent to your speakers, and it reads track metadata
+from whichever player exposes it over MPRIS. If `playerctl -l` sees
+your player, audiotap will work with it.
+
+Confirmed working:
+
+- **Local players:** mpv, VLC, Rhythmbox, Clementine, Strawberry, Audacious
+- **Native Linux clients:** Spotify (official `.deb` / AUR / Flatpak build)
+- **Anything in a browser:** Firefox and Chromium expose MPRIS for
+  HTML5 audio and video, which covers most web-based playback
+
+For browser-based players, use `-p firefox` (or `-p chromium`) as the
+target and `-m firefox` in silent mode to route only that browser's
+audio to the null sink.
+
+Some players emit sparse or partial metadata over MPRIS — track title
+may be present but artist or album empty. `parse_meta()` treats a line
+with at least one non-empty field as a valid track; empty fields are
+simply not written into the file tags.
 
 ## Recording quality
 
