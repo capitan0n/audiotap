@@ -183,6 +183,12 @@ it is your responsibility.
 
 GPLv3. See [LICENSE](LICENSE).
 
+## Stability
+
+Tested running continuously for 48 hours with various MPRIS-compatible players
+(browsers, native Linux clients) on Manjaro KDE (PipeWire) without crashes,
+memory leaks, or missed track splits.
+
 ## Contributing
 
 Bug reports and small patches welcome. Try to keep the tool small — the
