@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 
 # ----------------------------------------------------------------------------
 # Audio parameters. 48 kHz matches the native rate of most sinks, avoiding
@@ -50,13 +51,22 @@ FORMATS = {
 def sanitize(name):
     """Clean a string so it becomes a valid filename.
 
-    Titles from streaming services often contain /, |, :, emoji, etc. We
-    keep letters (in any alphabet — \\w is Unicode-aware in Python 3),
-    digits, spaces and a few safe punctuation marks.
+    Keeps letters (any alphabet), digits, spaces, all punctuation categories,
+    and currency symbols (€, $, £, ¥, etc.). Strips characters that are
+    unsafe on Linux/Windows filesystems regardless of Unicode category.
     """
-    clean = re.sub(r"[^\w\s\-.()\[\]']", "_", name, flags=re.UNICODE)
-    clean = re.sub(r"\s+", " ", clean).strip(" .")
-    return clean[:150] or "unknown"
+    def keep(c):
+        cat = unicodedata.category(c)
+        return (
+            cat.startswith(('L', 'N', 'Z', 'P')) or  # letters, digits, spaces, punctuation
+            cat == 'Sc'                                 # currency symbols: $, €, £, ¥ ...
+        )
+
+    clean = ''.join(c if keep(c) else '_' for c in name)
+    # Remove characters that are unsafe on common filesystems
+    clean = re.sub(r'[/\\:*?"<>|]', '_', clean)
+    clean = re.sub(r'\s+', ' ', clean).strip(' .')
+    return clean[:150] or 'unknown'
 
 
 def unique_path(path):
@@ -234,18 +244,21 @@ def start_sink_input_watcher(pattern, target_sink):
     threading.Thread(target=worker, daemon=True).start()
 
 
-def check_disk_space(outdir, hours_planned=3):
+def check_disk_space(outdir, hours_planned=3, fmt="flac"):
     """Warn if the disk does not have enough room for the planned capture.
 
-    Rough figures: FLAC ~5 MB/min, WAV ~11.5 MB/min. We take the worst case.
+    Rough MB/min estimates per format:
+        wav  ~11.5,  flac ~5,  mp3 ~1.4,  opus ~1
     """
+    mb_per_min = {"wav": 11.5, "flac": 5.0, "mp3": 1.4, "opus": 1.0}
+    rate = mb_per_min.get(fmt, 11.5)  # fall back to WAV if unknown
     free = shutil.disk_usage(outdir).free
-    needed = int(hours_planned * 60 * 11.5 * 1024 * 1024)   # WAV upper bound
+    needed = int(hours_planned * 60 * rate * 1024 * 1024)
     if free < needed:
         gb_free = free / (1024**3)
         gb_needed = needed / (1024**3)
         print(f"[!] Low free space: {gb_free:.1f} GB "
-              f"(~{gb_needed:.1f} GB needed for {hours_planned}h of WAV).")
+              f"(~{gb_needed:.1f} GB needed for {hours_planned}h of {fmt.upper()}).")
 
 
 # ============================================================================
@@ -458,7 +471,7 @@ def main():
     if args.silent:
         print("Mode   : SILENT (nothing plays on the speakers)")
     check_volume(sink)
-    check_disk_space(args.outdir)
+    check_disk_space(args.outdir, fmt=args.format)
 
     players = run(["playerctl", "-l"])
     print(f"Players: {players or '(none yet -- start playback)'}")
@@ -557,10 +570,9 @@ def main():
         if encoder:
             encoder.close()
         parec.terminate()
+        parec.wait()          # reap parec to avoid leaving a zombie process
         time.sleep(1.0)       # give the ffmpeg processes time to finish files
-        if null_module_id is not None:
-            unload_module(null_module_id)
-            print("Cleaned up the silent sink.")
+        # null_module_id is already unloaded via atexit.register(); no duplicate call needed
         print("Done.")
 
 
