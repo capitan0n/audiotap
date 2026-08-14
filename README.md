@@ -16,6 +16,9 @@ PipeWire systems as well as classic PulseAudio.
   new file every time the track changes
 - Encodes each track live through `ffmpeg`, with the artist / title /
   album / track number embedded as tags
+- Embeds the album cover from the player's MPRIS metadata (FLAC and MP3)
+- Optional lyrics fetch from [LRCLIB](https://lrclib.net): plain lyrics
+  go into the file's tags, synced lyrics become a `.lrc` sidecar
 - Sanitises track titles into safe filenames (Unicode-aware — Greek,
   Japanese, emoji, all fine)
 - Deletes files shorter than a configurable threshold (default 20 s), to
@@ -62,6 +65,7 @@ Then start capture:
     ./audiotap.py                            # FLAC into ./captures/
     ./audiotap.py -f opus -o ~/Recordings    # Opus into a different folder
     ./audiotap.py -p mpv                     # only follow mpv
+    ./audiotap.py -l                         # also fetch lyrics from LRCLIB
 
 Start playback in your player. A new file appears the moment the first
 track's metadata is announced, and each subsequent track change closes
@@ -87,6 +91,56 @@ output automatically.
 Without `-m`, you can move streams by hand from `pavucontrol` (Playback
 tab → dropdown → *Audiotap-Silent-Capture*).
 
+### Album covers (on by default)
+
+The cover is read straight from the current track's `mpris:artUrl` and
+embedded during encoding, so no separate step is needed.
+
+- Most native players (Spotify client, mpv, Rhythmbox, ...) expose the
+  cover as a `file://` URL pointing at their own on-disk cache. In that
+  case the fetch is a local file read — no network, no temp files.
+- Web players (music sites in Firefox / Chromium) usually expose the
+  cover as `https://` or as a `data:` URL. Those are downloaded once
+  per unique URL into `/tmp/audiotap_cover_*`, cached for the rest of
+  the session, and removed on exit.
+- Embedding is supported in **FLAC** and **MP3**. Opus is skipped
+  because embedding a picture into an Ogg Opus stream requires a
+  base64-encoded `METADATA_BLOCK_PICTURE` Vorbis comment that ffmpeg
+  does not write on its own; WAV has no cover format at all.
+- Disable with `--no-cover`.
+
+Cover resolution is whatever the player hands us — usually 300×300 or
+smaller. audiotap does not do external lookups against streaming
+provider APIs to fetch a higher-resolution version.
+
+### Lyrics (opt-in with `-l`)
+
+`-l` enables per-track lookups against [LRCLIB](https://lrclib.net) —
+an open, community-driven lyrics database with a no-key REST API. For
+each track:
+
+- Plain lyrics are embedded as a `lyrics` tag inside the audio file
+  (readable by most desktop players).
+- Synced lyrics are written as a sidecar `<track>.lrc` next to the
+  audio, in the standard LRC format:
+
+        Rosalia - Motomami.flac
+        Rosalia - Motomami.lrc
+
+  LRC sidecars are read by mpv, Strawberry, foobar2000, Poweramp, and
+  many other players — often with scrolling highlight during playback.
+
+The lookup is two-step: an exact match against `/api/get` first, then a
+fuzzy fallback against `/api/search` when casing or album spelling
+doesn't align (real-world case: MPRIS ships `TOQUEL` but LRCLIB has
+`Toquel`). Results are cached per track for the session. Any failure —
+no match, network error, malformed response — is silent, and capture
+continues.
+
+Coverage is best for popular international tracks; niche and
+underground artists may not be in the database. When they aren't, no
+sidecar is written and no tag is added.
+
 ### All options
 
     -f, --format          flac | mp3 | opus | wav       (default: flac)
@@ -95,9 +149,24 @@ tab → dropdown → *Audiotap-Silent-Capture*).
     -d, --device NAME     monitor source
     -s, --silent          route capture through a null sink
     -m, --move NAME       auto-move a given application's streams
+    -l, --lyrics          fetch lyrics from LRCLIB      (default: off)
+    --no-cover            do not embed album cover      (default: embed)
     --min-seconds N       drop files shorter than N seconds  (default: 20)
     --switch-delay N      delay cuts by N seconds             (default: 0.4)
     --list-players        list MPRIS players and exit
+
+## Network behaviour
+
+By default, audiotap only touches the network when the player itself
+gives us a remote URL for the cover — i.e. when using a web player.
+Native players with a local cover cache trigger zero outbound requests.
+
+Opting in to lyrics (`-l`) adds one HTTPS request per unique track to
+`lrclib.net`, and covers from web players hit whichever CDN the player
+uses (typically the streaming service's own image host). If you want
+a fully offline run:
+
+    ./audiotap.py --no-cover                 # covers off, lyrics off
 
 ## How it works
 
@@ -108,7 +177,9 @@ tab → dropdown → *Audiotap-Silent-Capture*).
    every time the currently-playing track changes.
 3. The main loop reads audio in ~21 ms blocks. Whenever a new metadata
    line arrives, the current `ffmpeg` process is closed (via EOF on its
-   stdin) and a new one is started for the next track.
+   stdin) and a new one is started for the next track — with the cover
+   attached as a second input and lyrics wired in as tags / sidecar
+   when enabled.
 4. Because the MPRIS event arrives slightly before the audio (the player
    updates its metadata as soon as it loads the next track, while the
    old track's audio is still buffered), cuts are delayed by
@@ -139,15 +210,15 @@ simply not written into the file tags.
 
 ## Recording quality
 
-The monitor source sits after the sound server's mixer, which means:
+The monitor source is captured before the sink's software volume stage
+on PipeWire and modern PulseAudio, so the slider position doesn't
+attenuate the recording. A few things still matter:
 
-- **Software volume affects amplitude.** Set the sink volume to 100 %
-  and control loudness from your speakers or amp. Otherwise you're
-  capturing an attenuated signal at reduced dynamic range. In silent
-  mode this is handled automatically.
 - **All streams routed to the same sink get mixed in.** Notifications,
   other apps, everything. Use silent mode with `-m` to route only one
   application, so nothing else ends up in the recording.
+- **Muted sinks may still produce silence** on some setups. If the sink
+  is muted, audiotap warns at startup.
 - **Format is negotiated with the server**, not the hardware. Any
   standard rate/depth combination works.
 

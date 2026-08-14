@@ -12,15 +12,19 @@ Requires: parec (libpulse), ffmpeg, playerctl
 import argparse
 import array
 import atexit
+import base64
+import json
 import os
 import queue
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
-import unicodedata
+import urllib.parse
+import urllib.request
 
 # ----------------------------------------------------------------------------
 # Audio parameters. 48 kHz matches the native rate of most sinks, avoiding
@@ -51,22 +55,13 @@ FORMATS = {
 def sanitize(name):
     """Clean a string so it becomes a valid filename.
 
-    Keeps letters (any alphabet), digits, spaces, all punctuation categories,
-    and currency symbols (€, $, £, ¥, etc.). Strips characters that are
-    unsafe on Linux/Windows filesystems regardless of Unicode category.
+    Titles from streaming services often contain /, |, :, emoji, etc. We
+    keep letters (in any alphabet — \\w is Unicode-aware in Python 3),
+    digits, spaces and a few safe punctuation marks.
     """
-    def keep(c):
-        cat = unicodedata.category(c)
-        return (
-            cat.startswith(('L', 'N', 'Z', 'P')) or  # letters, digits, spaces, punctuation
-            cat == 'Sc'                                 # currency symbols: $, €, £, ¥ ...
-        )
-
-    clean = ''.join(c if keep(c) else '_' for c in name)
-    # Remove characters that are unsafe on common filesystems
-    clean = re.sub(r'[/\\:*?"<>|]', '_', clean)
-    clean = re.sub(r'\s+', ' ', clean).strip(' .')
-    return clean[:150] or 'unknown'
+    clean = re.sub(r"[^\w\s\-.()\[\]']", "_", name, flags=re.UNICODE)
+    clean = re.sub(r"\s+", " ", clean).strip(" .")
+    return clean[:150] or "unknown"
 
 
 def unique_path(path):
@@ -100,26 +95,19 @@ def run(cmd):
 
 
 def check_volume(sink):
-    """Warn if the sink's software volume is not at 100%.
+    """Warn if the sink is muted.
 
-    This matters: the monitor source sits after the mixer, so software
-    volume affects the amplitude of the captured signal. Muted means you
-    will capture pure silence.
+    Software volume does NOT need to be at 100%: on PipeWire (and modern
+    PulseAudio) the monitor source is tapped before the sink's volume stage,
+    so the captured signal is unaffected by the slider position. Muting is
+    a separate matter — some setups still route silence to the monitor when
+    the sink is muted, so we keep that check.
     """
     mute = run(["pactl", "get-sink-mute", sink])
-    vol = run(["pactl", "get-sink-volume", sink])
 
     if "yes" in mute.lower():
-        print("[!] WARNING: the sink is MUTED — only silence will be recorded.")
+        print("[!] WARNING: the sink is MUTED — the capture may be silent.")
         print("    pactl set-sink-mute @DEFAULT_SINK@ 0")
-        return False
-
-    percents = [int(p) for p in re.findall(r"(\d+)%", vol)]
-    if percents and max(percents) < 100:
-        print(f"[!] WARNING: software volume is at {max(percents)}%.")
-        print("    The signal will be captured attenuated (dynamic range lost).")
-        print("    Suggested: pactl set-sink-volume @DEFAULT_SINK@ 100%")
-        print("    and control loudness from the speakers / amp instead.")
         return False
 
     return True
@@ -244,21 +232,25 @@ def start_sink_input_watcher(pattern, target_sink):
     threading.Thread(target=worker, daemon=True).start()
 
 
-def check_disk_space(outdir, hours_planned=3, fmt="flac"):
+def check_disk_space(outdir, fmt, hours_planned=3):
     """Warn if the disk does not have enough room for the planned capture.
 
-    Rough MB/min estimates per format:
-        wav  ~11.5,  flac ~5,  mp3 ~1.4,  opus ~1
+    Rough per-format footprint in MB per minute. Used for a sanity check
+    only — actual size varies with silence, compression, and content.
     """
-    mb_per_min = {"wav": 11.5, "flac": 5.0, "mp3": 1.4, "opus": 1.0}
-    rate = mb_per_min.get(fmt, 11.5)  # fall back to WAV if unknown
+    mb_per_min = {
+        "flac": 5.0,
+        "mp3":  1.5,
+        "opus": 1.0,
+        "wav":  11.5,
+    }.get(fmt, 11.5)
     free = shutil.disk_usage(outdir).free
-    needed = int(hours_planned * 60 * rate * 1024 * 1024)
+    needed = int(hours_planned * 60 * mb_per_min * 1024 * 1024)
     if free < needed:
         gb_free = free / (1024**3)
         gb_needed = needed / (1024**3)
         print(f"[!] Low free space: {gb_free:.1f} GB "
-              f"(~{gb_needed:.1f} GB needed for {hours_planned}h of {fmt.upper()}).")
+              f"(~{gb_needed:.1f} GB needed for {hours_planned}h of {fmt}).")
 
 
 # ============================================================================
@@ -273,7 +265,7 @@ class Encoder:
     is needed.
     """
 
-    def __init__(self, path, codec_args, tags, min_bytes):
+    def __init__(self, path, codec_args, tags, min_bytes, cover_path=None):
         self.path = path
         self.min_bytes = min_bytes
         self.written = 0
@@ -283,15 +275,38 @@ class Encoder:
             if value:
                 meta += ["-metadata", f"{key}={value}"]
 
+        # --- Attached picture ------------------------------------------------
+        # ffmpeg embeds a cover if we add it as a second input and map it as
+        # an attached picture. Only FLAC and MP3 accept this directly.
+        #
+        # WAV has no cover support in any player.
+        # Opus/Ogg requires the picture to be base64-encoded into the
+        # METADATA_BLOCK_PICTURE Vorbis comment, which ffmpeg does not do on
+        # its own — implementing it here would need a dependency or a lot of
+        # hand-rolled byte packing, so we skip it and keep the audio only.
+        pic_in = []
+        pic_map = []
+        ext = os.path.splitext(path)[1].lower()
+        if cover_path and ext in (".flac", ".mp3"):
+            pic_in = ["-i", cover_path]
+            pic_map = [
+                "-map", "0:a", "-map", "1:v",
+                "-c:v", "copy",
+                "-disposition:v:0", "attached_pic",
+                "-metadata:s:v", "title=Cover",
+                "-metadata:s:v", "comment=Cover (front)",
+            ]
+
         self.proc = subprocess.Popen(
             [
                 "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                # --- INPUT description (goes before -i): raw PCM has no
-                #     header, so we must declare the format explicitly ---
+                # --- INPUT 0: raw PCM (no header, declare format inline) ---
                 "-f", "s16le", "-ar", str(RATE), "-ac", str(CHANNELS),
                 "-i", "pipe:0",
+                # --- INPUT 1 (optional): cover image ---
+                *pic_in,
                 # --- OUTPUT ---
-                *codec_args, *meta, path,
+                *codec_args, *pic_map, *meta, path,
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
@@ -325,11 +340,15 @@ class Encoder:
         self.proc.wait()
         name = os.path.basename(self.path)
         if self.written < self.min_bytes:
-            # Too short: ad, jingle, or a pause/resume pseudo-event
-            try:
-                os.remove(self.path)
-            except OSError:
-                pass
+            # Too short: ad, jingle, or a pause/resume pseudo-event.
+            # Remove the audio file AND any sidecar we may have written
+            # (e.g. the .lrc from a --lyrics fetch), so nothing is left
+            # orphan.
+            for stray in (self.path, os.path.splitext(self.path)[0] + ".lrc"):
+                try:
+                    os.remove(stray)
+                except OSError:
+                    pass
             print(f"\r  x  {name}  ({self.seconds:.0f}s -- too short, deleted)")
         else:
             size_mb = (os.path.getsize(self.path) / 1e6
@@ -353,7 +372,7 @@ def start_metadata_watcher(player, out_queue):
     cmd += [
         "--follow", "metadata",
         "--format",
-        "{{artist}}\t{{title}}\t{{album}}\t{{xesam:trackNumber}}",
+        "{{artist}}\t{{title}}\t{{album}}\t{{xesam:trackNumber}}\t{{mpris:artUrl}}",
     ]
 
     def worker():
@@ -373,13 +392,266 @@ def start_metadata_watcher(player, out_queue):
 def parse_meta(line):
     """Turn a playerctl output line into a dict, or None if it's empty."""
     parts = line.split("\t")
-    while len(parts) < 4:
+    while len(parts) < 5:
         parts.append("")
-    artist, title, album, tracknum = (p.strip() for p in parts[:4])
+    artist, title, album, tracknum, art_url = (p.strip() for p in parts[:5])
     if not (artist or title):
         return None
     return {"artist": artist, "title": title,
-            "album": album, "track": tracknum}
+            "album": album, "track": tracknum,
+            "art_url": art_url}
+
+
+# ============================================================================
+# Cover art
+# ============================================================================
+#
+# MPRIS exposes the current track's cover through the mpris:artUrl field.
+# The value can be one of three schemes:
+#   file:///...    — a local file, usually the player's on-disk cache
+#   https://...    — a remote URL served by the streaming provider's CDN
+#   data:image/... — base64-embedded image (rare, but valid)
+#
+# We resolve each of them into a temporary file on disk and hand its path
+# to ffmpeg as a second input, so the picture is embedded natively in a
+# single encoding pass. Downloaded / decoded files are tracked in a set and
+# removed on exit; cached results are keyed by URL to avoid re-downloading
+# the same album cover for every track.
+# ----------------------------------------------------------------------------
+
+_COVER_CACHE = {}          # url -> local path (or None on failure)
+_COVER_TEMPFILES = set()   # paths we created and must clean up on exit
+_COVER_TIMEOUT = 3.0       # seconds — must stay small: fetch is synchronous
+
+# Known CDN patterns where a size hint is baked into the URL. Players usually
+# hand us a small thumbnail (64–300 px) that looks terrible when embedded and
+# viewed in a music app. Rewriting the URL to the same CDN's larger variant
+# gives us a hi-res cover for free — same host, same auth, same request
+# count, no extra API and no scraping. The rewrite is purely mechanical: if
+# the pattern doesn't match, we leave the URL alone.
+#
+# Spotify (i.scdn.co):
+#   Album covers use the namespace `ab67616d0000` followed by a 4-char size
+#   code and the image hash. Size codes: 4851 = 64px, 1e02 = 300px,
+#   b273 = 640px. We upgrade to b273 whenever we see an album URL.
+#   Artist images (ab67616100000...) and playlist images (ab67706f00000...)
+#   use different size codes we don't try to guess — left as-is.
+_SPOTIFY_ALBUM_RE = re.compile(
+    r"(https?://i\.scdn\.co/image/ab67616d0000)"
+    r"[0-9a-f]{4}"
+    r"([0-9a-f]+)"
+)
+
+
+def upgrade_cover_url(url):
+    """Return a higher-resolution variant of `url` when we recognise the CDN.
+
+    Only known-safe rewrites are applied. Anything unrecognised is returned
+    unchanged, so this is always a safe transformation to attempt.
+    """
+    if not url:
+        return url
+    # Spotify album covers -> 640x640
+    m = _SPOTIFY_ALBUM_RE.match(url)
+    if m:
+        return f"{m.group(1)}b273{m.group(2)}"
+    return url
+
+
+def _cleanup_covers():
+    for path in _COVER_TEMPFILES:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+atexit.register(_cleanup_covers)
+
+
+def _guess_ext(content_type, url):
+    """Pick a sensible extension from a Content-Type header or a URL path."""
+    ct = (content_type or "").lower()
+    if "jpeg" in ct or "jpg" in ct:
+        return ".jpg"
+    if "png" in ct:
+        return ".png"
+    if "webp" in ct:
+        return ".webp"
+    # Fallback: sniff the URL path
+    lower = url.lower()
+    for ext in (".jpg", ".jpeg", ".png", ".webp"):
+        if ext in lower:
+            return ".jpg" if ext == ".jpeg" else ext
+    return ".jpg"           # most CDNs serve JPEG anyway
+
+
+def fetch_cover(art_url):
+    """Resolve mpris:artUrl to a local file path, or return None on failure.
+
+    Results are cached per URL — the same album cover is downloaded once
+    even across many tracks. Never raises: any failure just returns None,
+    so recording is never blocked by a network hiccup.
+    """
+    if not art_url:
+        return None
+    if art_url in _COVER_CACHE:
+        return _COVER_CACHE[art_url]
+
+    path = None
+    try:
+        parsed = urllib.parse.urlparse(art_url)
+
+        if parsed.scheme == "file":
+            # Player already has it on disk — no download, no temp file.
+            local = urllib.parse.unquote(parsed.path)
+            if os.path.isfile(local):
+                path = local
+
+        elif parsed.scheme in ("http", "https"):
+            fetch_url = upgrade_cover_url(art_url)
+            req = urllib.request.Request(
+                fetch_url,
+                headers={"User-Agent": "audiotap/0.1"},
+            )
+            with urllib.request.urlopen(req, timeout=_COVER_TIMEOUT) as resp:
+                data = resp.read(8 * 1024 * 1024)   # cap at 8 MB
+                ext = _guess_ext(resp.headers.get("Content-Type"), fetch_url)
+            fd, path = tempfile.mkstemp(prefix="audiotap_cover_", suffix=ext)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            _COVER_TEMPFILES.add(path)
+
+        elif parsed.scheme == "data":
+            # data:[<mediatype>][;base64],<data>
+            header, _, payload = art_url[5:].partition(",")
+            if "base64" in header and payload:
+                ext = _guess_ext(header, "")
+                raw = base64.b64decode(payload, validate=False)
+                fd, path = tempfile.mkstemp(prefix="audiotap_cover_",
+                                            suffix=ext)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(raw)
+                _COVER_TEMPFILES.add(path)
+
+    except Exception:
+        # Network error, DNS failure, malformed URL, decode error — all fine.
+        path = None
+
+    _COVER_CACHE[art_url] = path
+    return path
+
+
+# ============================================================================
+# Lyrics (LRCLIB)
+# ============================================================================
+#
+# LRCLIB (https://lrclib.net) is a FOSS, community-maintained lyrics database
+# with an open REST API — no auth, no key, generous rate limits. We hit
+# /api/get with artist_name + track_name (plus album_name when we have it)
+# and get back JSON with `plainLyrics` and/or `syncedLyrics` (LRC format).
+#
+# Storage:
+#   - synced lyrics -> sidecar `<track>.lrc` next to the audio file
+#   - plain lyrics  -> embedded as a `lyrics` tag inside the audio file
+# The sidecar is the reliable path: universal player support, no encoder
+# re-run, and it survives any tag stripping the user might do later.
+#
+# We cache per (artist, title, album) tuple so repeated tracks in a session
+# don't hit the API twice. All failures are silent: if LRCLIB doesn't have
+# the song, or the network hiccups, we simply skip lyrics for that track.
+# ----------------------------------------------------------------------------
+
+_LYRICS_CACHE = {}         # (artist, title, album) -> dict|None
+_LYRICS_TIMEOUT = 3.0
+_LRCLIB_GET = "https://lrclib.net/api/get"
+_LRCLIB_SEARCH = "https://lrclib.net/api/search"
+
+
+def _lrclib_request(url):
+    """Perform one HTTPS GET against LRCLIB and return decoded JSON or None."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            # LRCLIB asks clients to identify themselves — see
+            # https://lrclib.net/docs.
+            "User-Agent": "audiotap/0.1 "
+                          "(https://github.com/capitan0n/audiotap)",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=_LYRICS_TIMEOUT) as resp:
+        return json.loads(resp.read(2 * 1024 * 1024).decode("utf-8"))
+
+
+def _extract_lyrics(data):
+    """Turn a LRCLIB record into {'plain', 'synced'} or None if both empty."""
+    plain = (data.get("plainLyrics") or "").strip()
+    synced = (data.get("syncedLyrics") or "").strip()
+    if plain or synced:
+        return {"plain": plain, "synced": synced}
+    return None
+
+
+def fetch_lyrics(artist, title, album=""):
+    """Query LRCLIB and return {'plain': str, 'synced': str} or None.
+
+    Two-step lookup:
+      1. /api/get — exact match on artist/title/album. Fast, but strict:
+         casing and album spelling must be right, so many real-world MPRIS
+         payloads (e.g. all-caps artist names) miss.
+      2. /api/search — fallback fuzzy search on the same keys. Returns an
+         array; we take the first hit.
+
+    Positive results are cached forever within the session; negative results
+    are cached too, but only for the current run. Never raises — network
+    errors, 404s, and malformed responses all just return None.
+    """
+    if not (artist and title):
+        return None
+    key = (artist, title, album)
+    if key in _LYRICS_CACHE:
+        return _LYRICS_CACHE[key]
+
+    result = None
+
+    # --- 1. Exact match ------------------------------------------------------
+    try:
+        params = {"artist_name": artist, "track_name": title}
+        if album:
+            params["album_name"] = album
+        result = _extract_lyrics(
+            _lrclib_request(f"{_LRCLIB_GET}?{urllib.parse.urlencode(params)}")
+        )
+    except Exception:
+        result = None
+
+    # --- 2. Fuzzy search fallback -------------------------------------------
+    if result is None:
+        try:
+            params = {"artist_name": artist, "track_name": title}
+            data = _lrclib_request(
+                f"{_LRCLIB_SEARCH}?{urllib.parse.urlencode(params)}"
+            )
+            if isinstance(data, list) and data:
+                result = _extract_lyrics(data[0])
+        except Exception:
+            result = None
+
+    _LYRICS_CACHE[key] = result
+    return result
+
+
+def write_lrc_sidecar(audio_path, synced_text):
+    """Write synced lyrics as `<audio>.lrc` next to the audio file."""
+    lrc_path = os.path.splitext(audio_path)[0] + ".lrc"
+    try:
+        with open(lrc_path, "w", encoding="utf-8") as f:
+            f.write(synced_text)
+            if not synced_text.endswith("\n"):
+                f.write("\n")
+        return lrc_path
+    except OSError:
+        return None
 
 
 # ============================================================================
@@ -415,6 +687,17 @@ def main():
                     help="With --silent: application name (e.g. firefox) "
                          "whose streams will be moved automatically to the "
                          "silent sink — existing ones and any that appear later.")
+    ap.add_argument("--no-cover", action="store_true",
+                    help="Do not embed the album cover. By default audiotap "
+                         "reads mpris:artUrl and embeds the picture. Local "
+                         "file:// URLs stay offline; http(s):// URLs cause a "
+                         "small fetch (3s timeout).")
+    ap.add_argument("-l", "--lyrics", action="store_true",
+                    help="Fetch lyrics from LRCLIB (lrclib.net) for each "
+                         "track. Synced lyrics are written as a .lrc file "
+                         "next to the audio; plain lyrics are embedded as a "
+                         "'lyrics' tag. Off by default — enables one HTTPS "
+                         "request per unique track.")
     args = ap.parse_args()
 
     check_dependencies()
@@ -471,7 +754,7 @@ def main():
     if args.silent:
         print("Mode   : SILENT (nothing plays on the speakers)")
     check_volume(sink)
-    check_disk_space(args.outdir, fmt=args.format)
+    check_disk_space(args.outdir, args.format)
 
     players = run(["playerctl", "-l"])
     print(f"Players: {players or '(none yet -- start playback)'}")
@@ -497,14 +780,38 @@ def main():
     pending = None            # (meta_dict, bytes_remaining) for delayed switch
     last_paint = 0.0
 
+    cover_supported = args.format in ("flac", "mp3")
+
     def open_encoder(meta):
         label = (f"{meta['artist']} - {meta['title']}"
                  if meta["artist"] else meta["title"])
         path = unique_path(os.path.join(args.outdir, sanitize(label) + ext))
         tags = {"title": meta["title"], "artist": meta["artist"],
                 "album": meta["album"], "track": meta["track"]}
-        print(f"\r-> {os.path.basename(path)}")
-        return Encoder(path, codec_args, tags, min_bytes)
+        cover_path = (fetch_cover(meta.get("art_url"))
+                      if not args.no_cover and cover_supported else None)
+
+        # --- Lyrics (opt-in via -l) --------------------------------------
+        lyr = (fetch_lyrics(meta["artist"], meta["title"], meta["album"])
+               if args.lyrics else None)
+        markers = []
+        if cover_path:
+            markers.append("+cover")
+        if lyr:
+            # Plain text goes into the audio file's tags; synced text is
+            # written as a sidecar after the encoder starts.
+            if lyr["plain"]:
+                tags["lyrics"] = lyr["plain"]
+                markers.append("+lyrics")
+            if lyr["synced"]:
+                sidecar = write_lrc_sidecar(path, lyr["synced"])
+                if sidecar:
+                    markers.append("+lrc")
+
+        marker_str = f"  [{' '.join(markers)}]" if markers else ""
+        print(f"\r-> {os.path.basename(path)}{marker_str}")
+        return Encoder(path, codec_args, tags, min_bytes,
+                       cover_path=cover_path)
 
     try:
         while True:
@@ -570,9 +877,9 @@ def main():
         if encoder:
             encoder.close()
         parec.terminate()
-        parec.wait()          # reap parec to avoid leaving a zombie process
+        parec.wait()          # reap the process, don't leave a zombie
         time.sleep(1.0)       # give the ffmpeg processes time to finish files
-        # null_module_id is already unloaded via atexit.register(); no duplicate call needed
+        # Silent-sink cleanup happens via atexit — no need to duplicate here.
         print("Done.")
 
 
